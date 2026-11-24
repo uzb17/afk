@@ -69,42 +69,45 @@ function startBot() {
     host: 'frokamc.uz',
     port: 25565,
     username: 'uzcraft',
-    version: '1.21.11' // Agar protokol xatosi chiqsa, false qilib ko'ring
+    version: '1.21.11'
   });
+
+  let loginSent = false;
+
+  function runLoginAndCommands() {
+    if (loginSent) return;
+    loginSent = true;
+
+    console.log('[CMD] /login 123456 yuborilmoqda...');
+    bot.chat('/login 123456');
+
+    setTimeout(() => {
+      console.log('[CMD] /server anarxiya2 yuborilmoqda...');
+      bot.chat('/server anarxiya2');
+    }, 6000);
+
+    setTimeout(() => {
+      console.log('[CMD] /pay casxuz 1m yuborilmoqda...');
+      bot.chat('/pay casxuz 1m');
+    }, 14000);
+
+    setTimeout(() => {
+      console.log('[CMD] /tpa casxuz yuborilmoqda...');
+      bot.chat('/tpa casxuz');
+    }, 19000);
+  }
 
   bot.once('spawn', () => {
     console.log('[BOT] Serverga ulanildi (spawn).');
 
-    // 1. Kirish va avtorizatsiya
+    // Zaxira taymer: 6 soniyadan keyin ham login ketmagan bo'lsa, yuboradi
     setTimeout(() => {
-      if (!bot.player) return;
-      console.log('[CMD] /login 123456 yuborilmoqda...');
-      bot.chat('/login 123456');
-    }, 2000);
+      runLoginAndCommands();
+    }, 6000);
 
-    // 2. Kerakli rejimga o'tish
-    setTimeout(() => {
-      if (!bot.player) return;
-      console.log('[CMD] /server anarxiya2 yuborilmoqda...');
-      bot.chat('/server anarxiya2');
-    }, 5000);
-
-    // 3. Birinchi kirishdagi buyruqlar
-    setTimeout(() => {
-      if (!bot.player) return;
-      console.log('[CMD] /pay casxuz 1m yuborilmoqda...');
-      bot.chat('/pay casxuz 1m');
-    }, 9000);
-
-    setTimeout(() => {
-      if (!bot.player) return;
-      console.log('[CMD] /tpa casxuz yuborilmoqda...');
-      bot.chat('/tpa casxuz');
-    }, 12000);
-
-    // 4. Anti-AFK: har 45 soniyada qarashni o'zgartirish va 200-500 ms random sakrash
+    // Anti-AFK: har 45 soniyada qarashni o'zgartirish va 200-500 ms random sakrash
     antiAfkInterval = setInterval(() => {
-      if (!bot.entity || !bot.player) return;
+      if (!bot.entity) return;
       const yaw = bot.entity.yaw + (Math.random() * 0.4 - 0.2);
       const pitch = Math.max(-0.5, Math.min(0.5, bot.entity.pitch + (Math.random() * 0.2 - 0.1)));
       bot.look(yaw, pitch, false).catch(() => {});
@@ -114,7 +117,7 @@ function startBot() {
       }, randomDelay(200, 500));
     }, 45000);
 
-    // 5. Har 3 daqiqada inventardagi barcha narsalarni tashlash
+    // Har 3 daqiqada inventardagi barcha narsalarni tashlash
     dropItemsInterval = setInterval(() => {
       dropAllItems(bot);
     }, 3 * 60 * 1000);
@@ -122,7 +125,15 @@ function startBot() {
 
   bot.on('message', (jsonMsg) => {
     const text = jsonMsg.toString().trim();
-    if (text) console.log('[CHAT]', text);
+    if (!text) return;
+    console.log('[CHAT]', text);
+
+    const lower = text.toLowerCase();
+    if (!loginSent && (lower.includes('/login') || lower.includes('/ʟᴏɢɪɴ'))) {
+      setTimeout(() => {
+        runLoginAndCommands();
+      }, 3000);
+    }
   });
 
   bot.on('kicked', (reason) => {
