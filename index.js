@@ -1,4 +1,5 @@
 const http = require('http');
+const zlib = require('zlib');
 const mineflayer = require('mineflayer');
 
 // ================= ENV SOZLAMALARI =================
@@ -70,6 +71,31 @@ async function sendTgMessage(chatId, text, replyMarkup = null) {
   }
 }
 
+async function sendTgPhotoBuffer(chatId, pngBuffer, caption = '') {
+  if (!TG_TOKEN || !chatId || !pngBuffer) return;
+  try {
+    const formData = new FormData();
+    formData.append('chat_id', String(chatId));
+    formData.append('caption', String(caption).slice(0, 1000));
+    formData.append(
+      'photo',
+      new Blob([pngBuffer], { type: 'image/png' }),
+      'map_captcha.png'
+    );
+
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
+      method: 'POST',
+      body: formData
+    });
+    const json = await res.json();
+    if (!json?.ok) {
+      console.log('[TG PHOTO API ERROR]', json?.description);
+    }
+  } catch (err) {
+    console.log('[TG PHOTO ERROR]', err.message);
+  }
+}
+
 function notifyOwner(text) {
   if (!OWNER_ID || !TG_TOKEN) return;
   sendTgMessage(OWNER_ID, text);
@@ -92,6 +118,172 @@ function extractNbtText(node) {
   if (node.text) out += extractNbtText(node.text);
   if (node.extra) out += extractNbtText(node.extra);
   return out;
+}
+
+// 128x128 xaritani kattalashtirib (scale=3 -> 384x384) PNG qilish
+function mapDataToPngBuffer(dataBytes, scale = 3) {
+  const width = 128;
+  const height = 128;
+  if (!dataBytes || dataBytes.length < width * height) return null;
+
+  const palette = [
+    [255, 255, 255],
+    [127, 178, 56], [247, 233, 163], [199, 199, 199], [255, 0, 0],
+    [160, 160, 255], [167, 167, 167], [0, 124, 0], [255, 255, 255],
+    [164, 168, 184], [151, 109, 77], [112, 112, 112], [64, 64, 255],
+    [143, 119, 72], [255, 252, 245], [216, 127, 51], [178, 76, 216],
+    [102, 153, 216], [229, 229, 51], [127, 204, 25], [242, 127, 165],
+    [76, 76, 76], [153, 153, 153], [76, 127, 153], [127, 63, 178],
+    [51, 76, 178], [102, 76, 51], [102, 127, 51], [153, 51, 51],
+    [25, 25, 25], [250, 238, 77], [92, 219, 213], [74, 128, 255],
+    [0, 217, 58], [129, 86, 49], [112, 2, 0]
+  ];
+
+  const outW = width * scale;
+  const outH = height * scale;
+  const raw = Buffer.alloc((outW * 4 + 1) * outH);
+
+  for (let y = 0; y < outH; y++) {
+    const srcY = Math.floor(y / scale);
+    const rowStart = y * (outW * 4 + 1);
+    raw[rowStart] = 0;
+
+    for (let x = 0; x < outW; x++) {
+      const srcX = Math.floor(x / scale);
+      const val = dataBytes[srcY * width + srcX] & 0xff;
+      const colorId = val >> 2;
+      const shadeId = val & 3;
+
+      let r = 255;
+      let g = 255;
+      let b = 255;
+
+      if (val !== 0) {
+        const base = palette[colorId] || [0, 0, 0];
+        const mult = shadeId === 0 ? 0.71 : shadeId === 1 ? 0.86 : shadeId === 2 ? 1.0 : 0.53;
+        r = Math.min(255, Math.round(base[0] * mult));
+        g = Math.min(255, Math.round(base[1] * mult));
+        b = Math.min(255, Math.round(base[2] * mult));
+      }
+
+      const px = rowStart + 1 + x * 4;
+      raw[px] = r;
+      raw[px + 1] = g;
+      raw[px + 2] = b;
+      raw[px + 3] = 255;
+    }
+  }
+
+  const idatData = zlib.deflateSync(raw);
+
+  function crc32(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) {
+      c ^= buf[i];
+      for (let k = 0; k < 8; k++) {
+        c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+      }
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  function makeChunk(type, data) {
+    const typeBuf = Buffer.from(type, 'ascii');
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(data.length, 0);
+    const crcInput = Buffer.concat([typeBuf, data]);
+    const crcBuf = Buffer.alloc(4);
+    crcBuf.writeUInt32BE(crc32(crcInput), 0);
+    return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(outW, 0);
+  ihdr.writeUInt32BE(outH, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  return Buffer.concat([
+    signature,
+    makeChunk('IHDR', ihdr),
+    makeChunk('IDAT', idatData),
+    makeChunk('IEND', Buffer.alloc(0))
+  ]);
+}
+
+function applyMapPacketToBuffer(acc, packet) {
+  if (!packet) return false;
+  if (!acc.mapCanvas) {
+    acc.mapCanvas = Buffer.alloc(128 * 128, 0);
+  }
+
+  const cols = Number(packet.columns || 0);
+  const rows = Number(packet.rows || 0);
+  const startX = Number(packet.x || 0);
+  const startY = Number(packet.y || 0);
+  const rawData = packet.data;
+
+  if (!rawData || !rawData.length) return false;
+
+  if (cols > 0 && rows > 0) {
+    for (let dy = 0; dy < rows; dy++) {
+      for (let dx = 0; dx < cols; dx++) {
+        const srcIdx = dy * cols + dx;
+        const dstX = startX + dx;
+        const dstY = startY + dy;
+        if (srcIdx < rawData.length && dstX >= 0 && dstX < 128 && dstY >= 0 && dstY < 128) {
+          acc.mapCanvas[dstY * 128 + dstX] = rawData[srcIdx];
+        }
+      }
+    }
+    acc.hasMapPixels = true;
+    return true;
+  }
+
+  if (rawData.length >= 128 * 128) {
+    Buffer.from(rawData.slice(0, 128 * 128)).copy(acc.mapCanvas);
+    acc.hasMapPixels = true;
+    return true;
+  }
+
+  return false;
+}
+
+async function processMapCaptcha(acc, reasonText = '') {
+  const bot = acc.bot;
+  if (!bot || !bot.entity) return;
+
+  try {
+    await bot.look(bot.entity.yaw, Math.PI / 2, false);
+  } catch (_) {}
+
+  await sleep(500);
+
+  if (acc.hasMapPixels && acc.mapCanvas && !acc.mapSentToUser) {
+    const png = mapDataToPngBuffer(acc.mapCanvas, 3);
+    if (png && OWNER_ID) {
+      acc.mapSentToUser = true;
+      await sendTgPhotoBuffer(
+        OWNER_ID,
+        png,
+        `🧩 [${acc.config.username}] xarita rasmi.\nXaritadagi so‘zni shu yerga yozib yuboring:`
+      );
+      return;
+    }
+  }
+
+  if (!acc.promptSentToUser) {
+    acc.promptSentToUser = true;
+    notifyOwner(
+      `🧩 [${acc.config.username}] pastga qaradi!\n` +
+      (reasonText ? `Chat: ${reasonText}\n` : '') +
+      `Xarita paketi kelsa rasm tashlanadi, bo‘lmasa javobni shu yerga yozib yuboring:`
+    );
+  }
 }
 
 async function registerBotCommands() {
@@ -321,7 +513,7 @@ async function startTelegramPolling() {
               if (acc.bot && acc.bot.entity) {
                 const pos = acc.bot.entity.position;
                 const itemsCount = acc.bot.inventory ? acc.bot.inventory.items().length : 0;
-                const waitTxt = acc.awaitingUserInput ? ' | ⏳ Captcha javobi kutilmoqda' : '';
+                const waitTxt = acc.awaitingUserInput ? ' | ⏳ Javob kutilmoqda' : '';
                 lines.push(
                   `${mark}🟢 [${acc.config.id}] ${acc.config.username} — Online${waitTxt}\n` +
                   `   📍 X:${Math.round(pos.x)} Y:${Math.round(pos.y)} Z:${Math.round(pos.z)} | 🎒 ${itemsCount} slot`
@@ -351,7 +543,7 @@ async function startTelegramPolling() {
             continue;
           }
 
-          // Agar faol (yoki kutayotgan) akkaunt captcha javobini kutayotgan bo'lsa
+          // Agar faol (yoki kutayotgan) akkaunt captcha/xarita javobini kutayotgan bo'lsa
           let targetWaitingAcc = getActiveAccount();
           if (!targetWaitingAcc?.awaitingUserInput) {
             for (const acc of accountsState.values()) {
@@ -378,7 +570,7 @@ async function startTelegramPolling() {
 
             await sendTgMessage(
               msg.chat.id,
-              `▶️ [${targetWaitingAcc.config.username}] javob yuborildi, login va keyingi buyruqlar davom etmoqda...`
+              `▶️ [${targetWaitingAcc.config.username}] yuborildi, login va keyingi buyruqlar davom etmoqda...`
             );
 
             setTimeout(() => {
@@ -480,6 +672,10 @@ function startAccountBot(acc) {
   cleanupAccountTimers(acc);
   acc.isDropping = false;
   acc.awaitingUserInput = false;
+  acc.mapCanvas = null;
+  acc.hasMapPixels = false;
+  acc.mapSentToUser = false;
+  acc.promptSentToUser = false;
 
   const bot = mineflayer.createBot({
     host: MC_HOST,
@@ -490,7 +686,7 @@ function startAccountBot(acc) {
 
   acc.bot = bot;
   let loginSent = false;
-  let captchaPromptSent = false;
+  let promptTriggered = false;
 
   const addStepTimeout = (fn, delay) => {
     const id = setTimeout(() => {
@@ -530,19 +726,37 @@ function startAccountBot(acc) {
   async function enterCaptchaWaitMode(reasonText = '') {
     if (loginSent || acc.bot !== bot || !bot.entity) return;
     acc.awaitingUserInput = true;
+    promptTriggered = true;
+    await processMapCaptcha(acc, reasonText);
+  }
 
-    try {
-      await bot.look(bot.entity.yaw, Math.PI / 2, false);
-    } catch (_) {}
+  if (bot._client) {
+    bot._client.on('packet', (data, meta) => {
+      if (!meta || !meta.name || !meta.name.includes('map')) return;
 
-    if (!captchaPromptSent) {
-      captchaPromptSent = true;
-      notifyOwner(
-        `🧩 [${acc.config.username}] captcha holatiga o‘tdi (pastga qaradi)!\n` +
-        (reasonText ? `Chat: ${reasonText}\n` : '') +
-        `Captchadagi belgilarni shu yerga yozib yuboring:`
-      );
-    }
+      const pixelBuffer =
+        (data && Buffer.isBuffer(data.data) && data.data) ||
+        (data && data.colorPatch && Buffer.isBuffer(data.colorPatch.data) && data.colorPatch.data) ||
+        null;
+
+      if (!pixelBuffer) return;
+
+      const patch = data.colorPatch || data;
+      const normalizedPacket = {
+        columns: patch.columns ?? 128,
+        rows: patch.rows ?? 128,
+        x: patch.x ?? 0,
+        y: patch.y ?? 0,
+        data: pixelBuffer
+      };
+
+      const updated = applyMapPacketToBuffer(acc, normalizedPacket);
+      if (updated && acc.awaitingUserInput && !acc.mapSentToUser) {
+        setTimeout(() => {
+          processMapCaptcha(acc);
+        }, 400);
+      }
+    });
   }
 
   bot.once('spawn', () => {
@@ -550,7 +764,6 @@ function startAccountBot(acc) {
     console.log(`[BOT:${acc.config.username}] Serverga ulanildi (spawn).`);
     notifyOwner(`🟢 [${acc.config.username}] ${MC_HOST} serveriga kirdi (spawn).`);
 
-    // Kirgach pastga qarab captcha javobini kutishga o'tadi
     addStepTimeout(() => {
       enterCaptchaWaitMode();
     }, 1500);
@@ -584,10 +797,10 @@ function startAccountBot(acc) {
     }
 
     const lower = text.toLowerCase();
-    if (!loginSent && (lower.includes('captcha') || lower.includes('urinish') || lower.includes('/register'))) {
+    if (!loginSent && !promptTriggered && (lower.includes('captcha') || lower.includes('urinish') || lower.includes('/register') || lower.includes('/login'))) {
       addStepTimeout(() => {
         enterCaptchaWaitMode(text);
-      }, 500);
+      }, 600);
     }
   });
 
@@ -641,7 +854,11 @@ function startAccountBot(acc) {
       isReconnecting: false,
       isDropping: false,
       awaitingUserInput: false,
-      continueAfterUserInput: null
+      continueAfterUserInput: null,
+      mapCanvas: null,
+      hasMapPixels: false,
+      mapSentToUser: false,
+      promptSentToUser: false
     };
     accountsState.set(cfg.id, accState);
     startAccountBot(accState);
