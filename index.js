@@ -1,4 +1,5 @@
 const http = require('http');
+const zlib = require('zlib');
 const mineflayer = require('mineflayer');
 
 // ================= ENV SOZLAMALARI =================
@@ -97,11 +98,9 @@ function notifyOwner(text) {
   sendTgMessage(OWNER_ID, text);
 }
 
-// Minecraft xarita (map) rang jadvalidan oddiy PNG buffer yasash (qo'shimcha paketlarsiz)
 function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
   if (!dataBytes || dataBytes.length < width * height) return null;
 
-  const zlib = require('zlib');
   const palette = [
     [0, 0, 0],
     [127, 178, 56], [247, 233, 163], [199, 199, 199], [255, 0, 0],
@@ -115,7 +114,6 @@ function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
     [0, 217, 58], [129, 86, 49], [112, 2, 0]
   ];
 
-  // Raw scanlines: [filterByte=0, R, G, B, A ...]
   const raw = Buffer.alloc((width * 4 + 1) * height);
   for (let y = 0; y < height; y++) {
     const rowStart = y * (width * 4 + 1);
@@ -161,8 +159,8 @@ function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // RGBA
+  ihdr[8] = 8;
+  ihdr[9] = 6;
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
@@ -181,32 +179,26 @@ async function lookDownAndSendPrompt(acc) {
   if (!bot || !bot.entity) return;
 
   try {
-    // Pastga qarash (pitch = +Math.PI / 2)
     await bot.look(bot.entity.yaw, Math.PI / 2, false);
   } catch (_) {}
 
   await sleep(400);
 
-  // Qo'ldagi yoki inventardagi xarita (filled_map) ni tekshirish
   const heldItem = bot.heldItem;
   const mapItem =
     (heldItem && heldItem.name === 'filled_map' && heldItem) ||
     (bot.inventory && bot.inventory.items().find((i) => i.name === 'filled_map'));
 
   let sentPhoto = false;
-  if (mapItem && mapItem.metadata !== undefined) {
-    // Mineflayer map event yoki slot ma'lumotidan rasm olish
-    const mapData = acc.lastMapData;
-    if (mapData) {
-      const png = mapDataToPngBuffer(mapData);
-      if (png && OWNER_ID) {
-        await sendTgPhotoBuffer(
-          OWNER_ID,
-          png,
-          `📸 [${acc.config.username}] pastga qaradi (Map). Davom etish uchun 1 ta xabar yuboring:`
-        );
-        sentPhoto = true;
-      }
+  if (mapItem && acc.lastMapData) {
+    const png = mapDataToPngBuffer(acc.lastMapData);
+    if (png && OWNER_ID) {
+      await sendTgPhotoBuffer(
+        OWNER_ID,
+        png,
+        `📸 [${acc.config.username}] pastga qaradi (Map). Davom etish uchun 1 ta xabar yuboring:`
+      );
+      sentPhoto = true;
     }
   }
 
@@ -475,12 +467,10 @@ async function startTelegramPolling() {
             continue;
           }
 
-          // Agar faol akkaunt foydalanuvchi xabarini kutayotgan bo'lsa
           const active = getActiveAccount();
           if (active && active.awaitingUserInput && active.bot && active.bot.entity) {
             active.awaitingUserInput = false;
 
-            // Agar foydalanuvchi "ok" yoki "davom" yozmasa, matnni MC ga ham yuborish mumkin
             const lowerInput = rawText.toLowerCase();
             if (lowerInput !== 'ok' && lowerInput !== 'davom' && lowerInput !== 'next') {
               const toSend = /^mc\s+/i.test(rawText)
@@ -564,4 +554,189 @@ function scheduleReconnect(acc, reason) {
 
 async function dropAllItems(acc, isManual = false) {
   const bot = acc.bot;
-  if (!bot || !
+  if (!bot || !bot.entity || !bot.inventory || acc.isDropping) return 0;
+
+  const items = bot.inventory.items();
+  if (items.length === 0) return 0;
+
+  acc.isDropping = true;
+  console.log(`[INVENTORY:${acc.config.username}] (${isManual ? 'MANUAL' : 'AUTO'}) ${items.length} ta slot tashlanmoqda...`);
+  let droppedCount = 0;
+
+  try {
+    for (const item of items) {
+      if (!acc.bot || acc.bot !== bot || !bot.entity) break;
+      try {
+        await bot.tossStack(item);
+        droppedCount++;
+        await sleep(randomDelay(200, 500));
+      } catch (err) {
+        console.log(`[DROP ERROR:${acc.config.username}]`, err.message);
+      }
+    }
+  } finally {
+    acc.isDropping = false;
+  }
+
+  return droppedCount;
+}
+
+function startAccountBot(acc) {
+  cleanupAccountTimers(acc);
+  acc.isDropping = false;
+  acc.awaitingUserInput = false;
+  acc.lastMapData = null;
+
+  const bot = mineflayer.createBot({
+    host: MC_HOST,
+    port: MC_PORT,
+    username: acc.config.username,
+    version: MC_VERSION
+  });
+
+  acc.bot = bot;
+  let loginSent = false;
+  let promptTriggered = false;
+
+  const addStepTimeout = (fn, delay) => {
+    const id = setTimeout(() => {
+      if (acc.bot === bot && bot.entity) fn();
+    }, delay);
+    acc.stepTimeouts.push(id);
+  };
+
+  function runLoginAndCommands() {
+    if (loginSent || acc.bot !== bot || !bot.entity) return;
+    loginSent = true;
+
+    console.log(`[CMD:${acc.config.username}] /login yuborilmoqda...`);
+    bot.chat(`/login ${acc.config.password}`);
+
+    addStepTimeout(() => {
+      console.log(`[CMD:${acc.config.username}] /server anarxiya2 yuborilmoqda...`);
+      bot.chat('/server anarxiya2');
+    }, 6000);
+
+    addStepTimeout(() => {
+      console.log(`[CMD:${acc.config.username}] /pay casxuz 1m yuborilmoqda...`);
+      bot.chat('/pay casxuz 1m');
+    }, 14000);
+
+    addStepTimeout(() => {
+      console.log(`[CMD:${acc.config.username}] /tpa casxuz yuborilmoqda...`);
+      bot.chat('/tpa casxuz');
+    }, 19000);
+  }
+
+  acc.continueAfterUserInput = () => {
+    if (acc.bot !== bot || !bot.entity) return;
+    runLoginAndCommands();
+  };
+
+  async function triggerLookDownAndWait() {
+    if (promptTriggered || loginSent || acc.bot !== bot || !bot.entity) return;
+    promptTriggered = true;
+    acc.awaitingUserInput = true;
+    await lookDownAndSendPrompt(acc);
+  }
+
+  if (bot._client) {
+    bot._client.on('map', (packet) => {
+      if (packet && packet.data) {
+        acc.lastMapData = packet.data;
+      }
+    });
+  }
+
+  bot.once('spawn', () => {
+    if (acc.bot !== bot) return;
+    console.log(`[BOT:${acc.config.username}] Serverga ulanildi (spawn).`);
+    notifyOwner(`🟢 [${acc.config.username}] ${MC_HOST} serveriga kirdi (spawn).`);
+
+    addStepTimeout(() => {
+      triggerLookDownAndWait();
+    }, 2000);
+
+    acc.antiAfkInterval = setInterval(() => {
+      if (acc.bot !== bot || !bot.entity || acc.awaitingUserInput) return;
+      const yaw = bot.entity.yaw + (Math.random() * 0.4 - 0.2);
+      const pitch = Math.max(-0.5, Math.min(0.5, bot.entity.pitch + (Math.random() * 0.2 - 0.1)));
+      bot.look(yaw, pitch, false).catch(() => {});
+      bot.setControlState('jump', true);
+      setTimeout(() => {
+        if (acc.bot === bot) bot.setControlState('jump', false);
+      }, randomDelay(200, 500));
+    }, 45000);
+
+    acc.dropItemsInterval = setInterval(() => {
+      if (!acc.awaitingUserInput) {
+        dropAllItems(acc, false);
+      }
+    }, 3 * 60 * 1000);
+  });
+
+  bot.on('message', (jsonMsg) => {
+    if (acc.bot !== bot) return;
+    const text = jsonMsg.toString().trim();
+    if (!text) return;
+    console.log(`[CHAT:${acc.config.username}]`, text);
+
+    if (chatRelayEnabled && OWNER_ID) {
+      chatBuffer.push(`[${acc.config.username}] ${text}`);
+    }
+
+    const lower = text.toLowerCase();
+    if (!loginSent && !promptTriggered && (lower.includes('/login') || lower.includes('/register') || lower.includes('/ʟᴏɢɪɴ'))) {
+      addStepTimeout(() => {
+        triggerLookDownAndWait();
+      }, 1500);
+    }
+  });
+
+  bot.on('kicked', (reason) => {
+    if (acc.bot !== bot) return;
+    console.log(`[KICKED:${acc.config.username}]`, reason);
+    acc.bot = null;
+    scheduleReconnect(acc, 'Kick qilindi');
+  });
+
+  bot.on('end', (reason) => {
+    if (acc.bot !== bot) return;
+    console.log(`[END:${acc.config.username}]`, reason || 'Ulanish yopildi');
+    acc.bot = null;
+    scheduleReconnect(acc, 'Sessiya tugadi');
+  });
+
+  bot.on('error', (err) => {
+    if (acc.bot !== bot) return;
+    console.log(`[ERROR:${acc.config.username}]`, err.message);
+    acc.bot = null;
+    scheduleReconnect(acc, 'Xatolik yuz berdi');
+  });
+}
+
+(async () => {
+  for (let i = 0; i < ACCOUNTS_CONFIG.length; i++) {
+    const cfg = ACCOUNTS_CONFIG[i];
+    const accState = {
+      config: cfg,
+      bot: null,
+      antiAfkInterval: null,
+      dropItemsInterval: null,
+      reconnectTimeout: null,
+      stepTimeouts: [],
+      isReconnecting: false,
+      isDropping: false,
+      awaitingUserInput: false,
+      continueAfterUserInput: null,
+      lastMapData: null
+    };
+    accountsState.set(cfg.id, accState);
+    startAccountBot(accState);
+
+    if (i < ACCOUNTS_CONFIG.length - 1) {
+      await sleep(5000);
+    }
+  }
+  startTelegramPolling();
+})();
