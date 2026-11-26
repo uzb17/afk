@@ -2,6 +2,13 @@ const http = require('http');
 const zlib = require('zlib');
 const mineflayer = require('mineflayer');
 
+let Tesseract = null;
+try {
+  Tesseract = require('tesseract.js');
+} catch (_) {
+  console.log('[OCR] tesseract.js topilmadi, faqat Telegram rasm rejimi ishlaydi.');
+}
+
 // ================= ENV SOZLAMALARI =================
 const TG_TOKEN = process.env.TG_TOKEN || '';
 const OWNER_ID = Number(process.env.OWNER_ID || 0);
@@ -10,6 +17,7 @@ const MC_HOST = process.env.MC_HOST || 'frokamc.uz';
 const MC_PORT = Number(process.env.MC_PORT || 25565);
 const MC_VERSION = process.env.MC_VERSION || '1.21.11';
 const SHARED_PASS = process.env.MC_PASS || '123456';
+const AUTO_OCR_ENABLED = process.env.AUTO_OCR !== 'false';
 
 const ACCOUNTS_CONFIG = [
   {
@@ -87,7 +95,10 @@ async function sendTgPhotoBuffer(chatId, pngBuffer, caption = '') {
       method: 'POST',
       body: formData
     });
-    await res.json();
+    const json = await res.json();
+    if (!json?.ok) {
+      console.log('[TG PHOTO API ERROR]', json?.description);
+    }
   } catch (err) {
     console.log('[TG PHOTO ERROR]', err.message);
   }
@@ -98,11 +109,14 @@ function notifyOwner(text) {
   sendTgMessage(OWNER_ID, text);
 }
 
-function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
+// 128x128 xaritani kattalashtirib (scale=3 -> 384x384) oq fonda aniq PNG qilish
+function mapDataToPngBuffer(dataBytes, scale = 3) {
+  const width = 128;
+  const height = 128;
   if (!dataBytes || dataBytes.length < width * height) return null;
 
   const palette = [
-    [0, 0, 0],
+    [255, 255, 255],
     [127, 178, 56], [247, 233, 163], [199, 199, 199], [255, 0, 0],
     [160, 160, 255], [167, 167, 167], [0, 124, 0], [255, 255, 255],
     [164, 168, 184], [151, 109, 77], [112, 112, 112], [64, 64, 255],
@@ -114,22 +128,38 @@ function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
     [0, 217, 58], [129, 86, 49], [112, 2, 0]
   ];
 
-  const raw = Buffer.alloc((width * 4 + 1) * height);
-  for (let y = 0; y < height; y++) {
-    const rowStart = y * (width * 4 + 1);
+  const outW = width * scale;
+  const outH = height * scale;
+  const raw = Buffer.alloc((outW * 4 + 1) * outH);
+
+  for (let y = 0; y < outH; y++) {
+    const srcY = Math.floor(y / scale);
+    const rowStart = y * (outW * 4 + 1);
     raw[rowStart] = 0;
-    for (let x = 0; x < width; x++) {
-      const val = dataBytes[y * width + x] & 0xff;
+
+    for (let x = 0; x < outW; x++) {
+      const srcX = Math.floor(x / scale);
+      const val = dataBytes[srcY * width + srcX] & 0xff;
       const colorId = val >> 2;
       const shadeId = val & 3;
-      const base = palette[colorId] || [255, 255, 255];
-      const mult = shadeId === 0 ? 0.71 : shadeId === 1 ? 0.86 : shadeId === 2 ? 1.0 : 0.53;
+
+      let r = 255;
+      let g = 255;
+      let b = 255;
+
+      if (val !== 0) {
+        const base = palette[colorId] || [0, 0, 0];
+        const mult = shadeId === 0 ? 0.71 : shadeId === 1 ? 0.86 : shadeId === 2 ? 1.0 : 0.53;
+        r = Math.min(255, Math.round(base[0] * mult));
+        g = Math.min(255, Math.round(base[1] * mult));
+        b = Math.min(255, Math.round(base[2] * mult));
+      }
 
       const px = rowStart + 1 + x * 4;
-      raw[px] = Math.min(255, Math.round(base[0] * mult));
-      raw[px + 1] = Math.min(255, Math.round(base[1] * mult));
-      raw[px + 2] = Math.min(255, Math.round(base[2] * mult));
-      raw[px + 3] = val === 0 ? 0 : 255;
+      raw[px] = r;
+      raw[px + 1] = g;
+      raw[px + 2] = b;
+      raw[px + 3] = 255;
     }
   }
 
@@ -157,8 +187,8 @@ function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
   }
 
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
+  ihdr.writeUInt32BE(outW, 0);
+  ihdr.writeUInt32BE(outH, 4);
   ihdr[8] = 8;
   ihdr[9] = 6;
   ihdr[10] = 0;
@@ -174,40 +204,114 @@ function mapDataToPngBuffer(dataBytes, width = 128, height = 128) {
   ]);
 }
 
-async function lookDownAndSendPrompt(acc) {
+function applyMapPacketToBuffer(acc, packet) {
+  if (!packet) return false;
+  if (!acc.mapCanvas) {
+    acc.mapCanvas = Buffer.alloc(128 * 128, 0);
+  }
+
+  const cols = Number(packet.columns || 0);
+  const rows = Number(packet.rows || 0);
+  const startX = Number(packet.x || 0);
+  const startY = Number(packet.y || 0);
+  const rawData = packet.data;
+
+  if (!rawData || !rawData.length) return false;
+
+  if (cols > 0 && rows > 0) {
+    for (let dy = 0; dy < rows; dy++) {
+      for (let dx = 0; dx < cols; dx++) {
+        const srcIdx = dy * cols + dx;
+        const dstX = startX + dx;
+        const dstY = startY + dy;
+        if (srcIdx < rawData.length && dstX >= 0 && dstX < 128 && dstY >= 0 && dstY < 128) {
+          acc.mapCanvas[dstY * 128 + dstX] = rawData[srcIdx];
+        }
+      }
+    }
+    acc.hasMapPixels = true;
+    return true;
+  }
+
+  if (rawData.length >= 128 * 128) {
+    Buffer.from(rawData.slice(0, 128 * 128)).copy(acc.mapCanvas);
+    acc.hasMapPixels = true;
+    return true;
+  }
+
+  return false;
+}
+
+async function tryReadMapWordWithOcr(pngBuffer) {
+  if (!Tesseract || !AUTO_OCR_ENABLED || !pngBuffer) return null;
+  try {
+    const result = await Tesseract.recognize(pngBuffer, 'eng', {
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    });
+    const cleaned = (result?.data?.text || '')
+      .replace(/[^A-Za-z0-9]/g, '')
+      .trim();
+    if (cleaned.length >= 3 && cleaned.length <= 12) {
+      return cleaned;
+    }
+  } catch (err) {
+    console.log('[OCR ERROR]', err.message);
+  }
+  return null;
+}
+
+async function processMapCaptcha(acc) {
   const bot = acc.bot;
-  if (!bot || !bot.entity) return;
+  if (!bot || !bot.entity || acc.mapSentToUser) return;
 
   try {
     await bot.look(bot.entity.yaw, Math.PI / 2, false);
   } catch (_) {}
 
-  await sleep(400);
+  await sleep(600);
 
-  const heldItem = bot.heldItem;
-  const mapItem =
-    (heldItem && heldItem.name === 'filled_map' && heldItem) ||
-    (bot.inventory && bot.inventory.items().find((i) => i.name === 'filled_map'));
+  if (acc.hasMapPixels && acc.mapCanvas) {
+    const png = mapDataToPngBuffer(acc.mapCanvas, 3);
+    if (png) {
+      acc.mapSentToUser = true;
 
-  let sentPhoto = false;
-  if (mapItem && acc.lastMapData) {
-    const png = mapDataToPngBuffer(acc.lastMapData);
-    if (png && OWNER_ID) {
-      await sendTgPhotoBuffer(
-        OWNER_ID,
-        png,
-        `📸 [${acc.config.username}] pastga qaradi (Map). Davom etish uchun 1 ta xabar yuboring:`
-      );
-      sentPhoto = true;
+      // Avval OCR bilan avtomatik o'qib ko'rish
+      const ocrWord = await tryReadMapWordWithOcr(png);
+      if (ocrWord && acc.bot === bot && bot.entity) {
+        console.log(`[OCR:${acc.config.username}] Xaritadan o'qilgan so'z: ${ocrWord}`);
+        if (OWNER_ID) {
+          await sendTgPhotoBuffer(
+            OWNER_ID,
+            png,
+            `🤖 [${acc.config.username}] xaritadan "${ocrWord}" so‘zini o‘qidi va chatga yubordi.`
+          );
+        }
+        bot.chat(ocrWord);
+        acc.awaitingUserInput = false;
+        setTimeout(() => {
+          if (typeof acc.continueAfterUserInput === 'function') {
+            acc.continueAfterUserInput();
+          }
+        }, 2500);
+        return;
+      }
+
+      // OCR bo'lmasa yoki o'qiy olmasa, PNG rasmni Telegramga tashlash va 1 ta xabar kutish
+      if (OWNER_ID) {
+        await sendTgPhotoBuffer(
+          OWNER_ID,
+          png,
+          `📸 [${acc.config.username}] qo‘lidagi xarita rasmi.\nXaritadagi so‘zni shu yerga yozib yuboring:`
+        );
+      }
+      return;
     }
   }
 
-  if (!sentPhoto) {
-    notifyOwner(
-      `📸 [${acc.config.username}] pastga qaradi!\n` +
-      `Register/captcha tekshiruvi kutilmoqda. Davom etish uchun shu yerga 1 ta xabar yuboring (masalan: kod yoki "ok"):`
-    );
-  }
+  notifyOwner(
+    `⏳ [${acc.config.username}] pastga qaradi, lekin server hali map paketini yubormadi.\n` +
+    `Xarita kelsa avtomatik rasm tashlanadi yoki hozir 1 ta xabar yuboring:`
+  );
 }
 
 async function registerBotCommands() {
@@ -437,7 +541,7 @@ async function startTelegramPolling() {
               if (acc.bot && acc.bot.entity) {
                 const pos = acc.bot.entity.position;
                 const itemsCount = acc.bot.inventory ? acc.bot.inventory.items().length : 0;
-                const waitTxt = acc.awaitingUserInput ? ' | ⏳ Xabar kutilmoqda' : '';
+                const waitTxt = acc.awaitingUserInput ? ' | ⏳ Map kodi kutilmoqda' : '';
                 lines.push(
                   `${mark}🟢 [${acc.config.id}] ${acc.config.username} — Online${waitTxt}\n` +
                   `   📍 X:${Math.round(pos.x)} Y:${Math.round(pos.y)} Z:${Math.round(pos.z)} | 🎒 ${itemsCount} slot`
@@ -467,9 +571,19 @@ async function startTelegramPolling() {
             continue;
           }
 
-          const active = getActiveAccount();
-          if (active && active.awaitingUserInput && active.bot && active.bot.entity) {
-            active.awaitingUserInput = false;
+          // Agar faol akkaunt (yoki kutayotgan akkaunt) xaritadagi so'zni kutayotgan bo'lsa
+          let targetWaitingAcc = getActiveAccount();
+          if (!targetWaitingAcc?.awaitingUserInput) {
+            for (const acc of accountsState.values()) {
+              if (acc.awaitingUserInput && acc.bot && acc.bot.entity) {
+                targetWaitingAcc = acc;
+                break;
+              }
+            }
+          }
+
+          if (targetWaitingAcc && targetWaitingAcc.awaitingUserInput && targetWaitingAcc.bot && targetWaitingAcc.bot.entity) {
+            targetWaitingAcc.awaitingUserInput = false;
 
             const lowerInput = rawText.toLowerCase();
             if (lowerInput !== 'ok' && lowerInput !== 'davom' && lowerInput !== 'next') {
@@ -477,24 +591,25 @@ async function startTelegramPolling() {
                 ? rawText.replace(/^mc\s+/i, '').trim()
                 : rawText;
               if (toSend) {
-                active.bot.chat(toSend);
-                console.log(`[TG -> MC:${active.config.username} (USER STEP)] ${toSend}`);
+                targetWaitingAcc.bot.chat(toSend);
+                console.log(`[TG -> MC:${targetWaitingAcc.config.username} (MAP CAPTCHA)] ${toSend}`);
               }
             }
 
             await sendTgMessage(
               msg.chat.id,
-              `▶️ [${active.config.username}] qabul qilindi, login va keyingi vazifalar davom etmoqda...`
+              `▶️ [${targetWaitingAcc.config.username}] so‘z yuborildi, login va keyingi vazifalar davom etmoqda...`
             );
 
             setTimeout(() => {
-              if (typeof active.continueAfterUserInput === 'function') {
-                active.continueAfterUserInput();
+              if (typeof targetWaitingAcc.continueAfterUserInput === 'function') {
+                targetWaitingAcc.continueAfterUserInput();
               }
-            }, 1000);
+            }, 2000);
             continue;
           }
 
+          const active = getActiveAccount();
           let mcText = rawText;
           if (/^mc\s+/i.test(rawText)) {
             mcText = rawText.replace(/^mc\s+/i, '').trim();
@@ -585,7 +700,9 @@ function startAccountBot(acc) {
   cleanupAccountTimers(acc);
   acc.isDropping = false;
   acc.awaitingUserInput = false;
-  acc.lastMapData = null;
+  acc.mapCanvas = null;
+  acc.hasMapPixels = false;
+  acc.mapSentToUser = false;
 
   const bot = mineflayer.createBot({
     host: MC_HOST,
@@ -637,13 +754,16 @@ function startAccountBot(acc) {
     if (promptTriggered || loginSent || acc.bot !== bot || !bot.entity) return;
     promptTriggered = true;
     acc.awaitingUserInput = true;
-    await lookDownAndSendPrompt(acc);
+    await processMapCaptcha(acc);
   }
 
   if (bot._client) {
     bot._client.on('map', (packet) => {
-      if (packet && packet.data) {
-        acc.lastMapData = packet.data;
+      const updated = applyMapPacketToBuffer(acc, packet);
+      if (updated && acc.awaitingUserInput && !acc.mapSentToUser) {
+        setTimeout(() => {
+          processMapCaptcha(acc);
+        }, 350);
       }
     });
   }
@@ -729,7 +849,9 @@ function startAccountBot(acc) {
       isDropping: false,
       awaitingUserInput: false,
       continueAfterUserInput: null,
-      lastMapData: null
+      mapCanvas: null,
+      hasMapPixels: false,
+      mapSentToUser: false
     };
     accountsState.set(cfg.id, accState);
     startAccountBot(accState);
